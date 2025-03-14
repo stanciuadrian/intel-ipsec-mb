@@ -128,6 +128,107 @@ typedef cpuset_t cpu_set_t;
 #define DEFAULT_BURST_SIZE 32
 #define MAX_BURST_SIZE     256
 
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <asm/unistd.h>
+#include <errno.h>
+
+typedef struct _result {
+        unsigned long long tsc_start;
+        unsigned long long tsc_end;
+        unsigned long long tsc_delta;
+        
+        uint64_t pmu_cycles_start; // always 0
+        uint64_t pmu_cycles_end;
+        uint64_t pmu_cycles_delta;
+} result;
+
+result RESULTS[100] = {};
+
+void fill_event_attr(struct perf_event_attr *event_attr, uint64_t config);
+long perf_event_open(
+        struct perf_event_attr *event_attr,
+        pid_t pid,
+        int cpu,
+        int group_fd,
+        unsigned long flags);
+int get_pmu_value(int fd, uint64_t *value);
+int perf_event_open_in_process(struct perf_event_attr *event_attr);
+
+long perf_event_open(
+        struct perf_event_attr *event_attr,
+        pid_t pid,
+        int cpu,
+        int group_fd,
+        unsigned long flags)
+{
+        int ret = syscall(
+                __NR_perf_event_open,
+                event_attr,
+                pid,
+                cpu,
+                group_fd,
+                flags);
+
+        return ret;
+}
+
+    int get_pmu_value(int fd, uint64_t *value)
+    {
+        uint64_t counter_value;
+        int res = read(fd, &counter_value, sizeof(uint64_t));
+    
+        switch (res)
+        {
+        case -1:
+        {
+            fprintf(stderr, "Read PMU on file descriptor %d returned %s.", fd, strerror(errno));
+            return -1;
+        }
+        case sizeof(uint64_t):
+        {
+            *value = counter_value;
+            return 0;
+        }
+        default:
+        {
+            fprintf(stderr, "Read PMU on file descriptor %d returned %d, different from expected %ld", fd, res, sizeof(uint64_t));
+            return -1;
+        }
+        }
+    }
+
+    int perf_event_open_in_process(struct perf_event_attr *event_attr)
+    {
+        int fd = perf_event_open(
+            event_attr,
+            /* pid */ 0,
+            /* cpu */ -1,
+            /* group_fd */ -1,
+            PERF_FLAG_FD_CLOEXEC);
+    
+        if (fd == -1)
+        {
+            fprintf(stderr, "Error opening event %llx\n: %s", event_attr->config, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+    
+        return fd;
+    }
+
+void fill_event_attr(struct perf_event_attr *event_attr, uint64_t config)
+{
+    memset(event_attr, 0, sizeof(struct perf_event_attr));
+
+    event_attr->type = PERF_TYPE_HARDWARE;
+    event_attr->size = sizeof(struct perf_event_attr);
+    event_attr->config = config;
+    event_attr->disabled = 1;
+    event_attr->exclude_kernel = 1;
+    event_attr->exclude_hv = 1;
+}
+
+
 enum arch_type_e { ARCH_SSE = 0, ARCH_AVX2, ARCH_AVX512, NUM_ARCHS };
 
 /* This enum will be mostly translated to IMB_CIPHER_MODE
@@ -2755,6 +2856,7 @@ do_test_gcm(struct params_s *params, const uint32_t num_iter, IMB_MGR *mb_mgr, u
         uint8_t *key;
         uint8_t *aad = NULL;
         uint64_t time = 0;
+        uint64_t time2 = 0;
         uint32_t aux;
 
         /* Force SGL API if segment size is not 0 */
@@ -2790,13 +2892,23 @@ do_test_gcm(struct params_s *params, const uint32_t num_iter, IMB_MGR *mb_mgr, u
                 break;
         }
 
+        struct perf_event_attr cycles_attr;
+        fill_event_attr(&cycles_attr, PERF_COUNT_HW_CPU_CYCLES);
+        int fd_cycles = perf_event_open_in_process(&cycles_attr);
+        // TODO close(fd_cycles);
+    
+        size_t crt = 0;
+        ioctl(fd_cycles, PERF_EVENT_IOC_RESET, 0);
+
         if (params->cipher_dir == IMB_DIR_ENCRYPT) {
 #ifndef _WIN32
+                ioctl(fd_cycles, PERF_EVENT_IOC_ENABLE, 0);
                 if (use_unhalted_cycles)
                         time = read_cycles(params->core);
                 else
 #endif
                         time = __rdtscp(&aux);
+                RESULTS[crt].tsc_start = time;
 
                 if (params->key_size == IMB_KEY_128_BYTES) {
                         if (use_gcm_sgl_api)
@@ -2823,13 +2935,32 @@ do_test_gcm(struct params_s *params, const uint32_t num_iter, IMB_MGR *mb_mgr, u
                                 run_gcm(mb_mgr->gcm256_enc, &gdata_key, &gdata_ctx, p_buffer,
                                         params->job_size, aad, num_iter);
                 }
+
 #ifndef _WIN32
                 if (use_unhalted_cycles)
-                        time = (read_cycles(params->core) - rd_cycles_cost) - time;
+                        time2 = read_cycles(params->core);
                 else
 #endif
-                        time = __rdtscp(&aux) - time;
-        } else { /*DECRYPT*/
+                        time2 = __rdtscp(&aux);
+#ifndef _WIN32
+                ioctl(fd_cycles, PERF_EVENT_IOC_DISABLE, 0);
+                get_pmu_value(fd_cycles, &RESULTS[crt].pmu_cycles_end);
+
+#endif
+                RESULTS[crt].tsc_end = time2;
+
+#ifndef _WIN32
+                if (use_unhalted_cycles)
+                        time = (time2 - rd_cycles_cost) - time;
+                else
+#endif
+                        time = time2 - time;
+
+                RESULTS[crt].tsc_delta = time;
+                RESULTS[crt].pmu_cycles_delta = RESULTS[crt].pmu_cycles_end - RESULTS[crt].pmu_cycles_start;
+                crt++;
+
+                } else { /*DECRYPT*/
 #ifndef _WIN32
                 if (use_unhalted_cycles)
                         time = read_cycles(params->core);
@@ -2872,6 +3003,19 @@ do_test_gcm(struct params_s *params, const uint32_t num_iter, IMB_MGR *mb_mgr, u
 
         free(key);
         free(aad);
+
+        printf("tsc_start,tsc_end,tsc_delta,pmu_cycles_start,pmu_cycles_end,pmu_cycles_delta\n");
+        for(size_t i=0;i<crt;i++) {
+                printf("%llu,%llu,%llu,%lu,%lu,%lu\n", 
+                        RESULTS[i].tsc_start,
+                        RESULTS[i].tsc_end,
+                        RESULTS[i].tsc_delta,
+                        RESULTS[i].pmu_cycles_start,
+                        RESULTS[i].pmu_cycles_end,
+                        RESULTS[i].pmu_cycles_delta
+                );
+                printf("tsc ratio: %f\n", (double)RESULTS[i].tsc_delta / RESULTS[i].pmu_cycles_delta);
+        }
 
         if (!num_iter)
                 return time;
