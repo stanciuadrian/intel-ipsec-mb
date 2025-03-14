@@ -3106,8 +3106,12 @@ process_variant(IMB_MGR *mgr, const enum arch_type_e arch, struct params_s *para
                 params->job_size = job_size;
 
                 if (test_api == TEST_API_DIRECT) {
-                        if (params->cipher_mode == TEST_GCM)
-                                *times = do_test_gcm(params, num_iter, mgr, p_buffer, p_keys);
+                        if (params->cipher_mode == TEST_GCM) {
+                                *times=1;
+                                while(*times) {
+                                        *times = do_test_gcm(params, num_iter, mgr, p_buffer, p_keys);
+                                }
+                        }
                         else if (params->cipher_mode == TEST_AEAD_CHACHA20)
                                 *times = do_test_chacha_poly(params, num_iter, mgr, p_buffer,
                                                              p_keys);
