@@ -3020,6 +3020,7 @@ do_test_gcm(struct params_s *params, const uint32_t num_iter, IMB_MGR *mb_mgr, u
         if (!num_iter)
                 return time;
 
+        printf("time %ld num_iter %d\n ratio=%f", time, num_iter, (double)time/num_iter);
         return time / num_iter;
 }
 
